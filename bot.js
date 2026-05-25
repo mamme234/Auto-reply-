@@ -5,30 +5,30 @@ const mongoose = require("mongoose");
 const express = require("express");
 
 const app = express();
+app.use(express.json());
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, {
-  polling: true
-});
+// ================= CONFIG =================
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 const ADMIN_ID = String(process.env.ADMIN_ID);
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ================= DB =================
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB Connected"))
-  .catch(err => console.log(err));
+mongoose.connect(process.env.MONGO_URI);
 
-// ================= USER =================
+// ================= USER MODEL =================
 const userSchema = new mongoose.Schema({
   userId: Number,
   username: String,
   firstName: String,
   balance: { type: Number, default: 0 },
+  xp: { type: Number, default: 0 },
+  level: { type: Number, default: 1 },
   referrals: { type: Number, default: 0 },
   refBy: { type: Number, default: null },
-  vip: { type: Number, default: 0 },
   joinedChannel: { type: Boolean, default: false },
-  lastAdWatch: { type: Number, default: 0 }
+  lastAd: { type: Number, default: 0 },
+  lastDaily: { type: Number, default: 0 }
 });
 
 const User = mongoose.model("User", userSchema);
@@ -43,29 +43,9 @@ const withdrawSchema = new mongoose.Schema({
 
 const Withdraw = mongoose.model("Withdraw", withdrawSchema);
 
-// ================= SERVER =================
-app.get("/", (req, res) => res.send("V3 Bot Running 🚀"));
-app.listen(process.env.PORT || 3000);
-
-// ================= HELPERS =================
-async function checkChannel(userId) {
-  try {
-    const res = await bot.getChatMember(CHANNEL_ID, userId);
-    return ["member", "administrator", "creator"].includes(res.status);
-  } catch {
-    return false;
-  }
-}
-
-function antiSpam(map, id, limit = 1200) {
-  const now = Date.now();
-  const last = map.get(id) || 0;
-  if (now - last < limit) return true;
-  map.set(id, now);
-  return false;
-}
-
-const spamMap = new Map();
+// ================= ADS CONFIG =================
+const ADS_REWARD = 2;
+const ADS_COOLDOWN = 30000;
 
 // ================= SAVE USER =================
 async function saveUser(msg, ref = null) {
@@ -90,62 +70,63 @@ async function saveUser(msg, ref = null) {
   return user;
 }
 
+// ================= SERVER =================
+app.post("/reward-ad", async (req, res) => {
+  const { userId } = req.body;
+
+  const user = await User.findOne({ userId });
+  if (!user) return res.sendStatus(404);
+
+  const now = Date.now();
+
+  if (now - user.lastAd < ADS_COOLDOWN) {
+    return res.json({ success: false, msg: "Cooldown" });
+  }
+
+  user.balance += ADS_REWARD;
+  user.xp += 1;
+  user.lastAd = now;
+
+  if (user.xp >= user.level * 10) {
+    user.level += 1;
+    user.xp = 0;
+  }
+
+  await user.save();
+
+  res.json({ success: true, balance: user.balance });
+});
+
+app.listen(process.env.PORT || 3000);
+
 // ================= START =================
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   await saveUser(msg, match?.[1] ? Number(match[1]) : null);
 
-  const joined = await checkChannel(msg.from.id);
-
   bot.sendMessage(msg.chat.id,
-`🚀 Welcome to V3 Earn Bot
+`🚀 V5 EARN BOT
 
-${joined ? "✅ Channel Verified" : "❌ Please join channel first"}
-
-💰 Earn via ads & tasks
-👥 Referral rewards active`,
+💰 Earn from Ads
+👥 Referral System
+🎁 Daily Rewards`,
 {
 reply_markup: {
 keyboard: [
-["💰 Wallet", "🎁 Daily Reward"],
-["📺 Watch Ad", "🛠 Tasks"],
-["👥 Referral", "💸 Withdraw"],
-["📢 Verify Channel"]
+["💰 Wallet", "📺 Watch Ads"],
+["🎁 Daily", "👥 Referral"],
+["💸 Withdraw"]
 ],
 resize_keyboard: true
 }
 });
 });
 
-// ================= MESSAGE =================
+// ================= MAIN =================
 bot.on("message", async (msg) => {
   if (!msg.text || msg.from.is_bot) return;
-  if (antiSpam(spamMap, msg.from.id)) return;
-
-  await saveUser(msg);
 
   const text = msg.text.toLowerCase();
-
-  if (text.startsWith("/start")) return;
-
-  const user = await User.findOne({ userId: msg.from.id });
-
-  // ================= VERIFY CHANNEL =================
-  if (text === "📢 verify channel") {
-    const joined = await checkChannel(msg.from.id);
-
-    if (joined) {
-      user.joinedChannel = true;
-      await user.save();
-      return bot.sendMessage(msg.chat.id, "✅ Verified!");
-    }
-
-    return bot.sendMessage(msg.chat.id, "❌ Join channel first");
-  }
-
-  // ================= BLOCK NON-JOINED =================
-  if (!user.joinedChannel) {
-    return bot.sendMessage(msg.chat.id, "⚠️ You must join channel first");
-  }
+  const user = await saveUser(msg);
 
   // ================= WALLET =================
   if (text === "💰 wallet") {
@@ -153,56 +134,48 @@ bot.on("message", async (msg) => {
 `💰 Wallet
 
 Balance: ${user.balance}
-VIP Level: ${user.vip}`);
+Level: ${user.level}
+XP: ${user.xp}/${user.level * 10}`);
   }
 
-  // ================= DAILY =================
-  if (text === "🎁 daily reward") {
-    const now = Date.now();
-
-    if (now - user.lastAdWatch < 86400000) {
-      return bot.sendMessage(msg.chat.id, "⏳ Already claimed today");
-    }
-
-    user.balance += 3;
-    user.lastAdWatch = now;
-    await user.save();
-
-    return bot.sendMessage(msg.chat.id, "🎁 +3 coins added");
-  }
-
-  // ================= AD SYSTEM =================
-  if (text === "📺 watch ad") {
-    const now = Date.now();
-
-    if (now - user.lastAdWatch < 30000) {
-      return bot.sendMessage(msg.chat.id, "⏳ Wait before watching next ad");
-    }
-
-    user.balance += 2;
-    user.lastAdWatch = now;
-    await user.save();
-
-    return bot.sendMessage(msg.chat.id,
-`📺 Ad completed
-💰 +2 coins`);
-  }
-
-  // ================= REFERRAL =================
+  // ================= REF =================
   if (text === "👥 referral") {
     return bot.sendMessage(msg.chat.id,
-`👥 Your link:
+`👥 Invite Link:
 https://t.me/YourBot?start=${msg.from.id}`);
   }
 
-  // ================= TASKS =================
-  if (text === "🛠 tasks") {
-    return bot.sendMessage(msg.chat.id,
-`🛠 Tasks
+  // ================= DAILY =================
+  if (text === "🎁 daily") {
+    const now = Date.now();
 
-1. Watch ad = 2 coins
-2. Invite friend = 5 coins
-3. Daily reward = 3 coins`);
+    if (now - user.lastDaily < 86400000) {
+      return bot.sendMessage(msg.chat.id, "⏳ Already claimed");
+    }
+
+    user.balance += 3;
+    user.lastDaily = now;
+    await user.save();
+
+    return bot.sendMessage(msg.chat.id, "🎁 +3 coins");
+  }
+
+  // ================= ADS =================
+  if (text === "📺 watch ads") {
+    return bot.sendMessage(msg.chat.id,
+`📺 Watch Ad & Earn`,
+{
+reply_markup: {
+inline_keyboard: [[
+{
+text: "▶️ Watch Ad",
+web_app: {
+url: "https://yourdomain.com/ads.html"
+}
+}
+]]
+}
+});
   }
 
   // ================= WITHDRAW =================
@@ -227,7 +200,7 @@ https://t.me/YourBot?start=${msg.from.id}`);
     bot.sendMessage(msg.chat.id, "✅ Withdraw sent");
 
     bot.sendMessage(ADMIN_ID,
-`💸 Withdraw Request
+`💸 Withdraw
 
 ID: ${w._id}
 User: ${msg.from.id}
@@ -235,7 +208,7 @@ Amount: ${amount}
 Method: ${method}`);
   }
 
-  // ================= ADMIN FORWARD =================
+  // ================= ADMIN =================
   if (msg.from.id.toString() !== ADMIN_ID) {
     bot.sendMessage(ADMIN_ID,
 `📩 User
@@ -248,54 +221,9 @@ Method: ${method}`);
 bot.on("reply_to_message", async (msg) => {
   if (msg.from.id.toString() !== ADMIN_ID) return;
 
-  const text = msg.reply_to_message?.text;
-  const match = text?.match(/🆔 (\d+)/);
+  const match = msg.reply_to_message?.text?.match(/🆔 (\d+)/);
 
   if (!match) return;
 
   bot.sendMessage(match[1], `📩 Admin Reply\n\n${msg.text}`);
-});
-
-// ================= ADMIN APPROVE =================
-bot.onText(/\/approve (.+)/, async (msg, match) => {
-  if (msg.from.id.toString() !== ADMIN_ID) return;
-
-  const id = match[1];
-
-  const w = await Withdraw.findByIdAndUpdate(id, { status: "approved" });
-
-  bot.sendMessage(ADMIN_ID, "✅ Approved");
-});
-
-// ================= ADMIN REJECT =================
-bot.onText(/\/reject (.+)/, async (msg, match) => {
-  if (msg.from.id.toString() !== ADMIN_ID) return;
-
-  const id = match[1];
-
-  const w = await Withdraw.findById(id);
-
-  if (w) {
-    await User.updateOne(
-      { userId: w.userId },
-      { $inc: { balance: w.amount } }
-    );
-    await w.deleteOne();
-  }
-
-  bot.sendMessage(ADMIN_ID, "❌ Rejected & refunded");
-});
-
-// ================= STATS =================
-bot.onText(/\/stats/, async (msg) => {
-  if (msg.from.id.toString() !== ADMIN_ID) return;
-
-  const users = await User.countDocuments();
-  const withdraws = await Withdraw.countDocuments();
-
-  bot.sendMessage(ADMIN_ID,
-`📊 V3 Stats
-
-Users: ${users}
-Withdraws: ${withdraws}`);
 });
