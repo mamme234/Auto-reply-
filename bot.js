@@ -7,114 +7,90 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-// ================= CONFIG =================
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 const ADMIN_ID = String(process.env.ADMIN_ID);
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const APP_URL = "https://auto-reply-xtnl.onrender.com";
 
 // ================= DB =================
 mongoose.connect(process.env.MONGO_URI);
 
-// ================= USER MODEL =================
+// ================= USER =================
 const userSchema = new mongoose.Schema({
   userId: Number,
   username: String,
-  firstName: String,
-  balance: { type: Number, default: 0 },
-  xp: { type: Number, default: 0 },
-  level: { type: Number, default: 1 },
-  referrals: { type: Number, default: 0 },
-  refBy: { type: Number, default: null },
-  joinedChannel: { type: Boolean, default: false },
-  lastAd: { type: Number, default: 0 },
-  lastDaily: { type: Number, default: 0 }
+  firstName: String
 });
 
 const User = mongoose.model("User", userSchema);
 
-// ================= WITHDRAW =================
-const withdrawSchema = new mongoose.Schema({
+// ================= TICKET =================
+const ticketSchema = new mongoose.Schema({
+  ticketId: String,
   userId: Number,
-  amount: Number,
-  method: String,
-  status: { type: String, default: "pending" }
+  message: String,
+  status: { type: String, default: "open" },
+  createdAt: { type: Date, default: Date.now }
 });
 
-const Withdraw = mongoose.model("Withdraw", withdrawSchema);
-
-// ================= ADS CONFIG =================
-const ADS_REWARD = 2;
-const ADS_COOLDOWN = 30000;
+const Ticket = mongoose.model("Ticket", ticketSchema);
 
 // ================= SAVE USER =================
-async function saveUser(msg, ref = null) {
+async function saveUser(msg) {
   let user = await User.findOne({ userId: msg.from.id });
 
   if (!user) {
     user = await User.create({
       userId: msg.from.id,
       username: msg.from.username || "",
-      firstName: msg.from.first_name || "",
-      refBy: ref
+      firstName: msg.from.first_name || ""
     });
-
-    if (ref && ref !== msg.from.id) {
-      await User.updateOne(
-        { userId: ref },
-        { $inc: { balance: 5, referrals: 1 } }
-      );
-    }
   }
 
   return user;
 }
 
-// ================= SERVER =================
-app.post("/reward-ad", async (req, res) => {
-  const { userId } = req.body;
+// ================= AUTO REPLY =================
+function autoReply(text) {
+  const t = text.toLowerCase();
 
-  const user = await User.findOne({ userId });
-  if (!user) return res.sendStatus(404);
+  if (t.includes("login")) return "🔐 Try resetting your password.";
+  if (t.includes("error")) return "⚠️ Please send screenshot.";
+  if (t.includes("payment")) return "💰 Payments may take up to 24h.";
+  if (t.includes("app")) return "📲 Open app and update latest version.";
+  if (t.includes("hello")) return "👋 Hello! How can I help you?";
 
-  const now = Date.now();
+  return null;
+}
 
-  if (now - user.lastAd < ADS_COOLDOWN) {
-    return res.json({ success: false, msg: "Cooldown" });
-  }
+// ================= CREATE TICKET =================
+async function createTicket(msg) {
+  const id = "T" + Date.now();
 
-  user.balance += ADS_REWARD;
-  user.xp += 1;
-  user.lastAd = now;
+  await Ticket.create({
+    ticketId: id,
+    userId: msg.from.id,
+    message: msg.text
+  });
 
-  if (user.xp >= user.level * 10) {
-    user.level += 1;
-    user.xp = 0;
-  }
-
-  await user.save();
-
-  res.json({ success: true, balance: user.balance });
-});
-
-app.listen(process.env.PORT || 3000);
+  return id;
+}
 
 // ================= START =================
-bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
-  await saveUser(msg, match?.[1] ? Number(match[1]) : null);
+bot.onText(/\/start/, async (msg) => {
+  await saveUser(msg);
 
   bot.sendMessage(msg.chat.id,
-`🚀 V5 EARN BOT
+`🚀 V100 PRO SUPPORT SYSTEM
 
-💰 Earn from Ads
-👥 Referral System
-🎁 Daily Rewards`,
+💬 App Help Center
+🎫 Ticket-based support
+⚡ Fast responses`,
 {
 reply_markup: {
 keyboard: [
-["💰 Wallet", "📺 Watch Ads"],
-["🎁 Daily", "👥 Referral"],
-["💸 Withdraw"]
+["❓ FAQ", "📞 Support"],
+["🎫 My Ticket", "🌐 Open App"]
 ],
 resize_keyboard: true
 }
@@ -125,96 +101,61 @@ resize_keyboard: true
 bot.on("message", async (msg) => {
   if (!msg.text || msg.from.is_bot) return;
 
-  const text = msg.text.toLowerCase();
-  const user = await saveUser(msg);
+  const text = msg.text;
+  const lower = text.toLowerCase();
 
-  // ================= WALLET =================
-  if (text === "💰 wallet") {
+  await saveUser(msg);
+
+  // ================= FAQ =================
+  if (lower === "❓ faq") {
     return bot.sendMessage(msg.chat.id,
-`💰 Wallet
+`📌 FAQ
 
-Balance: ${user.balance}
-Level: ${user.level}
-XP: ${user.xp}/${user.level * 10}`);
+1. Login issue → reset password
+2. Payment delay → wait 24h
+3. App error → send screenshot`);
   }
 
-  // ================= REF =================
-  if (text === "👥 referral") {
+  // ================= OPEN APP =================
+  if (lower === "🌐 open app") {
     return bot.sendMessage(msg.chat.id,
-`👥 Invite Link:
-https://t.me/YourBot?start=${msg.from.id}`);
+`🚀 Open App:
+${APP_URL}`);
   }
 
-  // ================= DAILY =================
-  if (text === "🎁 daily") {
-    const now = Date.now();
+  // ================= SUPPORT =================
+  if (lower === "📞 support") {
+    const ticketId = await createTicket(msg);
 
-    if (now - user.lastDaily < 86400000) {
-      return bot.sendMessage(msg.chat.id, "⏳ Already claimed");
-    }
-
-    user.balance += 3;
-    user.lastDaily = now;
-    await user.save();
-
-    return bot.sendMessage(msg.chat.id, "🎁 +3 coins");
-  }
-
-  // ================= ADS =================
-  if (text === "📺 watch ads") {
     return bot.sendMessage(msg.chat.id,
-`📺 Watch Ad & Earn`,
-{
-reply_markup: {
-inline_keyboard: [[
-{
-text: "▶️ Watch Ad",
-web_app: {
-url: "https://yourdomain.com/ads.html"
-}
-}
-]]
-}
-});
+`🎫 Ticket Created
+
+ID: ${ticketId}
+Status: OPEN
+
+We will reply soon.`);
   }
 
-  // ================= WITHDRAW =================
-  if (text.startsWith("withdraw")) {
-    const parts = text.split(" ");
-    const amount = Number(parts[1]);
-    const method = parts.slice(2).join(" ");
+  // ================= AUTO REPLY =================
+  const reply = autoReply(text);
 
-    if (user.balance < amount) {
-      return bot.sendMessage(msg.chat.id, "❌ Not enough balance");
-    }
-
-    user.balance -= amount;
-    await user.save();
-
-    const w = await Withdraw.create({
-      userId: msg.from.id,
-      amount,
-      method
-    });
-
-    bot.sendMessage(msg.chat.id, "✅ Withdraw sent");
-
-    bot.sendMessage(ADMIN_ID,
-`💸 Withdraw
-
-ID: ${w._id}
-User: ${msg.from.id}
-Amount: ${amount}
-Method: ${method}`);
+  if (reply) {
+    return bot.sendMessage(msg.chat.id, reply);
   }
 
-  // ================= ADMIN =================
+  // ================= USER MESSAGE → ADMIN =================
   if (msg.from.id.toString() !== ADMIN_ID) {
     bot.sendMessage(ADMIN_ID,
-`📩 User
+`📩 NEW MESSAGE
+
+👤 ${msg.from.first_name}
 🆔 ${msg.from.id}
-💬 ${msg.text}`);
+
+💬 ${text}`);
   }
+
+  // default reply
+  bot.sendMessage(msg.chat.id, "🤖 Message received. Support will reply soon.");
 });
 
 // ================= ADMIN REPLY =================
@@ -225,5 +166,53 @@ bot.on("reply_to_message", async (msg) => {
 
   if (!match) return;
 
-  bot.sendMessage(match[1], `📩 Admin Reply\n\n${msg.text}`);
+  const userId = match[1];
+
+  bot.sendMessage(userId,
+`📩 ADMIN REPLY
+
+${msg.text}`);
+});
+
+// ================= ADMIN TICKETS LIST =================
+bot.onText(/\/tickets/, async (msg) => {
+  if (msg.from.id.toString() !== ADMIN_ID) return;
+
+  const tickets = await Ticket.find({ status: "open" }).limit(10);
+
+  let text = "🎫 OPEN TICKETS:\n\n";
+
+  tickets.forEach(t => {
+    text += `ID: ${t.ticketId} | USER: ${t.userId}\n`;
+  });
+
+  bot.sendMessage(ADMIN_ID, text || "No tickets");
+});
+
+// ================= CLOSE TICKET =================
+bot.onText(/\/close (.+)/, async (msg, match) => {
+  if (msg.from.id.toString() !== ADMIN_ID) return;
+
+  const id = match[1];
+
+  await Ticket.findOneAndUpdate(
+    { ticketId: id },
+    { status: "closed" }
+  );
+
+  bot.sendMessage(ADMIN_ID, "✅ Ticket closed");
+});
+
+// ================= STATS =================
+bot.onText(/\/stats/, async (msg) => {
+  if (msg.from.id.toString() !== ADMIN_ID) return;
+
+  const users = await User.countDocuments();
+  const tickets = await Ticket.countDocuments();
+
+  bot.sendMessage(ADMIN_ID,
+`📊 V100 PRO STATS
+
+Users: ${users}
+Tickets: ${tickets}`);
 });
