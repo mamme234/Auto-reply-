@@ -1,0 +1,16 @@
+{
+  "name": "studybuddy-helper-bot",
+  "version": "1.0.0",
+  "description": "Telegram helper bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.5.1",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
