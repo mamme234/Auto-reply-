@@ -5,7 +5,6 @@ const mongoose = require("mongoose");
 const express = require("express");
 const winston = require("winston");
 const rateLimit = require("express-rate-limit");
-const Redis = require("ioredis");
 const cron = require("node-cron");
 const nodemailer = require("nodemailer");
 const OpenAI = require("openai");
@@ -28,7 +27,6 @@ const config = {
   botToken: process.env.BOT_TOKEN,
   adminId: String(process.env.ADMIN_ID),
   mongoUri: process.env.MONGO_URI,
-  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   openaiKey: process.env.OPENAI_KEY,
   smtpHost: process.env.SMTP_HOST,
   smtpUser: process.env.SMTP_USER,
@@ -41,20 +39,22 @@ const config = {
 // ================= INIT SERVICES =================
 const app = express();
 const bot = new TelegramBot(config.botToken, { polling: true });
-let redis;
 let openai;
 let transporter;
 
-// Initialize services conditionally
-try {
-  redis = new Redis(config.redisUrl);
+// Initialize OpenAI if key exists
+if (config.openaiKey && config.openaiKey !== "your_openai_key_here") {
   openai = new OpenAI({ apiKey: config.openaiKey });
+  logger.info("OpenAI initialized");
+}
+
+// Initialize email if configured
+if (config.smtpHost && config.smtpUser && config.smtpPass) {
   transporter = nodemailer.createTransport({
     host: config.smtpHost,
     auth: { user: config.smtpUser, pass: config.smtpPass }
   });
-} catch (error) {
-  logger.warn("Some services not available", error);
+  logger.info("Email transporter initialized");
 }
 
 // ================= MIDDLEWARE =================
@@ -74,6 +74,14 @@ mongoose.connect(config.mongoUri, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
   serverSelectionTimeoutMS: 5000
+});
+
+mongoose.connection.on("connected", () => {
+  console.log("✅ MongoDB connected");
+});
+
+mongoose.connection.on("error", (err) => {
+  console.error("❌ MongoDB error:", err);
 });
 
 // User schema
@@ -96,7 +104,7 @@ const UserSchema = new mongoose.Schema({
   lastActiveAt: Date
 });
 
-// Ticket schema - SINGLE DECLARATION
+// Ticket schema
 const TicketSchema = new mongoose.Schema({
   ticketId: { type: String, unique: true, default: () => `T${Date.now()}-${uuidv4().slice(0, 6)}` },
   userId: Number,
@@ -133,22 +141,6 @@ const TicketSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-// Knowledge base schema
-const KbSchema = new mongoose.Schema({
-  articleId: String,
-  title: String,
-  content: String,
-  tags: [String],
-  embedding: [Number],
-  views: { type: Number, default: 0 },
-  helpful: { type: Number, default: 0 },
-  notHelpful: { type: Number, default: 0 },
-  language: String,
-  createdBy: String,
-  createdAt: Date,
-  updatedAt: Date
-});
-
 // Analytics schema
 const AnalyticsSchema = new mongoose.Schema({
   date: { type: Date, default: Date.now, index: true },
@@ -159,40 +151,72 @@ const AnalyticsSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", UserSchema);
 const Ticket = mongoose.model("Ticket", TicketSchema);
-const KBArticle = mongoose.model("KBArticle", KbSchema);
 const Analytics = mongoose.model("Analytics", AnalyticsSchema);
 
-// ================= CACHE LAYER =================
-class CacheManager {
-  static async get(key) { 
-    if (!redis) return null;
-    return redis.get(key); 
+// Simple in-memory cache (replaces Redis)
+class SimpleCache {
+  constructor() {
+    this.cache = new Map();
   }
-  static async set(key, value, ttl = 3600) { 
-    if (!redis) return null;
-    return redis.set(key, JSON.stringify(value), "EX", ttl); 
+  
+  async get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    if (item.expiry && item.expiry < Date.now()) {
+      this.cache.delete(key);
+      return null;
+    }
+    return item.value;
   }
-  static async del(key) { 
-    if (!redis) return null;
-    return redis.del(key); 
+  
+  async set(key, value, ttl = 3600) {
+    this.cache.set(key, {
+      value: JSON.stringify(value),
+      expiry: Date.now() + (ttl * 1000)
+    });
   }
-  static async increment(key) { 
-    if (!redis) return null;
-    return redis.incr(key); 
+  
+  async del(key) {
+    this.cache.delete(key);
+  }
+  
+  async increment(key) {
+    const val = await this.get(key);
+    const newVal = val ? parseInt(val) + 1 : 1;
+    await this.set(key, newVal);
+    return newVal;
   }
 }
+
+const cache = new SimpleCache();
 
 // ================= AI CLASSIFIER =================
 class AIClassifier {
   static async classifyTicket(message) {
-    if (!openai) return { category: "other", priority: "normal", sentiment: "neutral", tags: [] };
+    if (!openai) {
+      // Simple keyword-based classification
+      const msg = message.toLowerCase();
+      let category = "other";
+      let priority = "normal";
+      
+      if (msg.includes("login") || msg.includes("password") || msg.includes("account")) category = "account";
+      if (msg.includes("pay") || msg.includes("billing") || msg.includes("refund")) category = "billing";
+      if (msg.includes("error") || msg.includes("crash") || msg.includes("bug")) category = "technical";
+      if (msg.includes("feature") || msg.includes("suggest")) category = "feature";
+      
+      if (msg.includes("urgent") || msg.includes("emergency") || msg.includes("critical")) priority = "urgent";
+      if (msg.includes("important") || msg.includes("blocked")) priority = "high";
+      if (msg.includes("not urgent") || msg.includes("whenever")) priority = "low";
+      
+      return { category, priority, sentiment: "neutral", tags: [] };
+    }
     
     try {
       const completion = await openai.chat.completions.create({
         model: "gpt-3.5-turbo",
         messages: [{
           role: "system",
-          content: "Classify support tickets into: category (technical/billing/account/feature/other), priority (low/normal/high/urgent), sentiment (positive/neutral/negative), and suggested tags. Return JSON only."
+          content: "Classify support tickets into: category (technical/billing/account/feature/other), priority (low/normal/high/urgent), sentiment (positive/neutral/negative). Return JSON only."
         }, {
           role: "user",
           content: message
@@ -200,39 +224,31 @@ class AIClassifier {
         temperature: 0.3
       });
       
-      const result = JSON.parse(completion.choices[0].message.content);
-      return result;
+      return JSON.parse(completion.choices[0].message.content);
     } catch (error) {
       logger.error("AI classification failed", error);
       return { category: "other", priority: "normal", sentiment: "neutral", tags: [] };
     }
   }
   
-  static async findSimilarArticles(message) {
-    if (!openai) return [];
-    
-    try {
-      const embedding = await openai.embeddings.create({
-        model: "text-embedding-3-small",
-        input: message
-      });
-      
-      const articles = await KBArticle.find().limit(3);
-      return articles;
-    } catch (error) {
-      logger.error("Similar articles search failed", error);
-      return [];
-    }
-  }
-  
   static autoReply(text) {
     const t = text.toLowerCase();
-    if (t.includes("login") || t.includes("password")) return "🔐 Having login issues? Try resetting your password via the 'Forgot Password' link.";
-    if (t.includes("error") || t.includes("bug")) return "⚠️ Please send a screenshot of the error so we can investigate faster.";
-    if (t.includes("payment") || t.includes("billing")) return "💰 Payments may take up to 24 hours to process. Contact support if longer.";
-    if (t.includes("hello") || t.includes("hi")) return "👋 Hello! How can I help you today?";
-    if (t.includes("thank")) return "You're welcome! 😊 Anything else I can help with?";
-    if (t.includes("slow") || t.includes("lag")) return "🐢 Performance issues? Try clearing cache and updating to latest version.";
+    const replies = {
+      "login|password|sign in": "🔐 Having login issues? Try:\n1. Reset password via 'Forgot Password'\n2. Clear app cache\n3. Update to latest version",
+      "error|bug|crash": "⚠️ Please send a screenshot of the error. Our team will investigate ASAP.",
+      "payment|billing|refund|charge": "💰 Payment issues? Transactions take up to 24h. For refunds, please provide order ID.",
+      "hello|hi|hey": "👋 Hello! How can I help you today?",
+      "thank|thanks": "You're welcome! 😊 Anything else?",
+      "slow|lag|freeze": "🐢 Performance issues? Try:\n1. Clear cache\n2. Check internet connection\n3. Update app",
+      "feature|suggestion": "💡 Thanks for the suggestion! We'll forward it to our product team.",
+      "where|how to": "📚 Check our FAQ or create a ticket for detailed help."
+    };
+    
+    for (const [pattern, reply] of Object.entries(replies)) {
+      if (new RegExp(pattern, "i").test(t)) {
+        return reply;
+      }
+    }
     return null;
   }
 }
@@ -258,23 +274,22 @@ class SupportService {
       message,
       category: classification.category,
       priority: classification.priority,
-      tags: classification.tags,
+      tags: classification.tags || [],
       slaDeadline,
       metadata: { ...metadata, sentiment: classification.sentiment }
     });
     
-    await User.updateOne({ userId }, { $inc: { totalTickets: 1 }, lastActiveAt: new Date() });
+    await User.updateOne(
+      { userId }, 
+      { $inc: { totalTickets: 1 }, lastActiveAt: new Date() },
+      { upsert: true }
+    );
     
     await Analytics.create({
       metric: "ticket_created",
       value: 1,
       breakdown: { priority: classification.priority, category: classification.category }
     });
-    
-    const similarArticles = await AIClassifier.findSimilarArticles(message);
-    if (similarArticles.length > 0 && bot) {
-      await bot.sendMessage(userId, `📚 Related articles:\n${similarArticles.map(a => `• ${a.title}`).join("\n")}`);
-    }
     
     if (classification.priority === "urgent") {
       await this.notifyAdmins(ticket);
@@ -287,7 +302,7 @@ class SupportService {
     const ticket = await Ticket.findOne({ ticketId });
     if (!ticket) throw new Error("Ticket not found");
     
-    ticket.messages.push({ from, message, isInternal });
+    ticket.messages.push({ from, message, isInternal, timestamp: new Date() });
     ticket.updatedAt = new Date();
     
     if (from === "admin" && !ticket.firstResponseAt) {
@@ -354,27 +369,16 @@ class SupportService {
   }
   
   static async notifyAdmins(ticket) {
-    if (!bot) return;
+    const message = `🚨 URGENT TICKET ${ticket.ticketId}\nPriority: ${ticket.priority}\nMessage: ${ticket.message.slice(0, 100)}`;
     
-    const admins = await User.find({ isAdmin: true });
-    for (const admin of admins) {
-      await bot.sendMessage(admin.userId, 
-        `🚨 URGENT TICKET ${ticket.ticketId}\nPriority: ${ticket.priority}\nMessage: ${ticket.message.slice(0, 100)}`
-      ).catch(() => {});
-    }
-    
-    await bot.sendMessage(config.adminId, 
-      `🚨 URGENT TICKET ${ticket.ticketId}\nPriority: ${ticket.priority}\nUser: ${ticket.userId}`
-    ).catch(() => {});
+    await bot.sendMessage(config.adminId, message).catch(() => {});
   }
   
   static async logSLABreach(ticket) {
     logger.warn(`SLA breach for ticket ${ticket.ticketId}`);
     await Analytics.create({ metric: "sla_breach", value: 1 });
     
-    if (bot) {
-      await bot.sendMessage(config.adminId, `⚠️ SLA BREACH: Ticket ${ticket.ticketId} missed ${ticket.priority} priority SLA`);
-    }
+    await bot.sendMessage(config.adminId, `⚠️ SLA BREACH: Ticket ${ticket.ticketId} missed ${ticket.priority} priority SLA`);
   }
   
   static async sendEmailNotification(user, ticket, message) {
@@ -383,7 +387,7 @@ class SupportService {
     await transporter.sendMail({
       to: user.email,
       subject: `Support Ticket ${ticket.ticketId} Update`,
-      html: `<p>Your ticket has a new reply:</p><p>${message}</p><p>Ticket ID: ${ticket.ticketId}</p>`
+      html: `<h3>Ticket #${ticket.ticketId}</h3><p>New reply:</p><p>${message}</p><p>Reply to this email or in Telegram.</p>`
     }).catch(error => logger.error("Email failed", error));
   }
   
@@ -393,39 +397,36 @@ class SupportService {
     if (timeframe === "week") startDate.setDate(startDate.getDate() - 7);
     if (timeframe === "month") startDate.setMonth(startDate.getMonth() - 1);
     
-    const stats = {
-      totalTickets: await Ticket.countDocuments({ createdAt: { $gt: startDate } }),
-      openTickets: await Ticket.countDocuments({ status: { $in: ["open", "in_progress"] } }),
-      avgFirstResponse: await this.calculateAvgResponseTime(startDate),
-      csatScore: await this.calculateCSAT(startDate),
-      ticketsByPriority: await Ticket.aggregate([
+    const [totalTickets, openTickets, avgResponseResult, csatResult, priorityBreakdown, categoryBreakdown] = await Promise.all([
+      Ticket.countDocuments({ createdAt: { $gt: startDate } }),
+      Ticket.countDocuments({ status: { $in: ["open", "in_progress"] } }),
+      Ticket.aggregate([
+        { $match: { firstResponseAt: { $exists: true }, createdAt: { $gt: startDate } } },
+        { $addFields: { responseMinutes: { $divide: [{ $subtract: ["$firstResponseAt", "$createdAt"] }, 60000] } } },
+        { $group: { _id: null, avg: { $avg: "$responseMinutes" } } }
+      ]),
+      Ticket.aggregate([
+        { $match: { csatScore: { $exists: true }, createdAt: { $gt: startDate } } },
+        { $group: { _id: null, avg: { $avg: "$csatScore" } } }
+      ]),
+      Ticket.aggregate([
         { $match: { createdAt: { $gt: startDate } } },
         { $group: { _id: "$priority", count: { $sum: 1 } } }
       ]),
-      ticketsByCategory: await Ticket.aggregate([
+      Ticket.aggregate([
         { $match: { createdAt: { $gt: startDate } } },
         { $group: { _id: "$category", count: { $sum: 1 } } }
       ])
-    };
+    ]);
     
-    return stats;
-  }
-  
-  static async calculateAvgResponseTime(startDate) {
-    const result = await Ticket.aggregate([
-      { $match: { firstResponseAt: { $exists: true }, createdAt: { $gt: startDate } } },
-      { $addFields: { responseMinutes: { $divide: [{ $subtract: ["$firstResponseAt", "$createdAt"] }, 60000] } } },
-      { $group: { _id: null, avg: { $avg: "$responseMinutes" } } }
-    ]);
-    return result[0]?.avg || 0;
-  }
-  
-  static async calculateCSAT(startDate) {
-    const result = await Ticket.aggregate([
-      { $match: { csatScore: { $exists: true }, createdAt: { $gt: startDate } } },
-      { $group: { _id: null, avg: { $avg: "$csatScore" } } }
-    ]);
-    return result[0]?.avg || 0;
+    return {
+      totalTickets,
+      openTickets,
+      avgFirstResponse: avgResponseResult[0]?.avg || 0,
+      csatScore: csatResult[0]?.avg || 0,
+      ticketsByPriority: priorityBreakdown,
+      ticketsByCategory: categoryBreakdown
+    };
   }
 }
 
@@ -440,6 +441,7 @@ async function saveUser(msg) {
       firstName: msg.from.first_name || "",
       lastName: msg.from.last_name || ""
     });
+    console.log(`📝 New user: ${msg.from.first_name} (${msg.from.id})`);
   }
   
   return user;
@@ -459,10 +461,15 @@ bot.onText(/\/start/, async (msg) => {
   };
   
   bot.sendMessage(msg.chat.id,
-    `🚀 PRO SUPPORT CENTER\n\nHi ${msg.from.first_name}! How can we help you today?\n\n` +
-    `• Click "New Ticket" to create a support request\n` +
-    `• Check "My Tickets" for existing tickets\n` +
-    `• FAQ for quick answers`, keyboard);
+    `🚀 **PRO SUPPORT CENTER**\n\n` +
+    `Hi ${msg.from.first_name}! How can we help you today?\n\n` +
+    `📌 **Quick Commands:**\n` +
+    `• ❓ FAQ - Quick answers\n` +
+    `• 📞 New Ticket - Create support request\n` +
+    `• 📋 My Tickets - Check existing tickets\n` +
+    `• ⭐ Status - System health\n\n` +
+    `💬 Just type your question and I'll help!`,
+    { parse_mode: "Markdown", ...keyboard });
 });
 
 bot.on("message", async (msg) => {
@@ -476,22 +483,26 @@ bot.on("message", async (msg) => {
   // Menu handlers
   if (lower === "❓ faq") {
     return bot.sendMessage(msg.chat.id,
-      `📌 FREQUENTLY ASKED QUESTIONS\n\n` +
-      `1. **Login Issues** - Reset password via app\n` +
-      `2. **Payment Delays** - Wait 24h, then contact us\n` +
-      `3. **App Crashes** - Update to latest version\n` +
-      `4. **Account Access** - Verify your email\n\n` +
-      `Need more help? Create a ticket with "New Ticket"`);
+      `📌 **FREQUENTLY ASKED QUESTIONS**\n\n` +
+      `**Login Issues**\n→ Reset password via app\n→ Clear app cache\n\n` +
+      `**Payment Problems**\n→ Wait 24h for processing\n→ Contact support with order ID\n\n` +
+      `**App Errors**\n→ Update to latest version\n→ Restart app\n→ Send screenshot to support\n\n` +
+      `**Account Access**\n→ Verify email address\n→ Check spam folder\n\n` +
+      `❓ Need more help? Create a ticket with "New Ticket"`,
+      { parse_mode: "Markdown" });
   }
   
   if (lower === "📞 new ticket") {
     return bot.sendMessage(msg.chat.id, 
-      `🎫 Please describe your issue in detail:\n\n` +
-      `Include:\n` +
+      `🎫 **Create New Ticket**\n\n` +
+      `Please describe your issue in detail:\n\n` +
+      `📌 Include:\n` +
       `• What happened?\n` +
       `• When did it happen?\n` +
-      `• Any error messages?\n\n` +
-      `I'll create a ticket for you.`);
+      `• Any error messages?\n` +
+      `• Screenshots (if any)\n\n` +
+      `Just type your message and I'll create a ticket for you!`,
+      { parse_mode: "Markdown" });
   }
   
   if (lower === "📋 my tickets") {
@@ -502,20 +513,27 @@ bot.on("message", async (msg) => {
     }
     
     const ticketList = tickets.map(t => 
-      `🎫 ${t.ticketId}\nStatus: ${t.status} | Priority: ${t.priority}\nCreated: ${t.createdAt.toLocaleDateString()}\n`
+      `🎫 **${t.ticketId}**\nStatus: ${t.status.toUpperCase()} | Priority: ${t.priority.toUpperCase()}\nCreated: ${t.createdAt.toLocaleDateString()}\n`
     ).join("\n");
     
-    return bot.sendMessage(msg.chat.id, `📋 YOUR TICKETS\n\n${ticketList}`);
+    return bot.sendMessage(msg.chat.id, `📋 **YOUR TICKETS**\n\n${ticketList}\n\nReply to admin messages to continue conversation.`, { parse_mode: "Markdown" });
   }
   
   if (lower === "⭐ status") {
     const stats = await SupportService.getStats("day");
+    const users = await User.countDocuments();
+    const openTickets = await Ticket.countDocuments({ status: { $in: ["open", "in_progress"] } });
+    
     return bot.sendMessage(msg.chat.id,
-      `📊 SYSTEM STATUS\n\n` +
+      `📊 **SYSTEM STATUS**\n\n` +
       `✅ All systems operational\n` +
+      `👥 Total users: ${users}\n` +
+      `🎫 Open tickets: ${openTickets}\n` +
       `📈 Today's tickets: ${stats.totalTickets}\n` +
       `⏱️ Avg response: ${Math.round(stats.avgFirstResponse)} minutes\n` +
-      `⭐ CSAT score: ${stats.csatScore.toFixed(1)}/5`);
+      `⭐ CSAT score: ${stats.csatScore.toFixed(1)}/5\n\n` +
+      `🟢 Bot is online and ready to help!`,
+      { parse_mode: "Markdown" });
   }
   
   // Auto-reply first
@@ -528,17 +546,21 @@ bot.on("message", async (msg) => {
   try {
     const ticket = await SupportService.createTicket(msg.from.id, text, { source: "telegram" });
     bot.sendMessage(msg.chat.id, 
-      `✅ Ticket #${ticket.ticketId} created\n\n` +
-      `Priority: ${ticket.priority.toUpperCase()}\n` +
-      `Response time: within ${config.slaHours[ticket.priority]} hours\n\n` +
-      `We'll notify you when we reply!`);
+      `✅ **Ticket #${ticket.ticketId} created!**\n\n` +
+      `📌 Priority: ${ticket.priority.toUpperCase()}\n` +
+      `⏱️ Response time: within ${config.slaHours[ticket.priority]} hours\n\n` +
+      `We'll notify you when we reply. You can check status anytime with "My Tickets".`,
+      { parse_mode: "Markdown" });
     
     // Notify admin
     bot.sendMessage(config.adminId,
-      `📩 NEW TICKET #${ticket.ticketId}\n` +
-      `From: ${msg.from.first_name} (@${msg.from.username || 'no username'})\n` +
-      `Priority: ${ticket.priority}\n` +
-      `Message: ${text.slice(0, 200)}`);
+      `📩 **NEW TICKET #${ticket.ticketId}**\n\n` +
+      `👤 From: ${msg.from.first_name} (@${msg.from.username || 'no username'})\n` +
+      `🆔 User ID: ${msg.from.id}\n` +
+      `⚡ Priority: ${ticket.priority.toUpperCase()}\n` +
+      `📝 Message: ${text.slice(0, 300)}${text.length > 300 ? '...' : ''}\n\n` +
+      `Reply to this user by replying to any message with their ticket #.`,
+      { parse_mode: "Markdown" });
       
   } catch (error) {
     bot.sendMessage(msg.chat.id, `⚠️ ${error.message}`);
@@ -567,10 +589,18 @@ bot.on("reply_to_message", async (msg) => {
   if (msg.from.id.toString() !== config.adminId) return;
   
   // Extract ticket ID from replied message
-  const match = msg.reply_to_message?.text?.match(/#(T\d+-\w+)/);
-  if (!match) return;
+  let ticketId = null;
   
-  const ticketId = match[1];
+  // Check various patterns
+  if (msg.reply_to_message?.text) {
+    const text = msg.reply_to_message.text;
+    const match = text.match(/#(T\d+-\w+)/);
+    if (match) ticketId = match[1];
+  }
+  
+  if (!ticketId) {
+    return bot.sendMessage(msg.chat.id, "❌ Could not find ticket ID. Make sure you're replying to a ticket message.");
+  }
   
   try {
     await SupportService.addReply(ticketId, "admin", msg.text);
@@ -578,9 +608,13 @@ bot.on("reply_to_message", async (msg) => {
     
     // Notify user
     const ticket = await Ticket.findOne({ ticketId });
-    if (ticket && bot) {
+    if (ticket) {
       bot.sendMessage(ticket.userId, 
-        `📩 ADMIN REPLY\n\nTicket: ${ticketId}\n\n${msg.text}\n\nReply to this message to continue.`);
+        `📩 **ADMIN REPLY**\n\n` +
+        `Ticket: ${ticketId}\n\n` +
+        `${msg.text}\n\n` +
+        `Reply to this message to continue the conversation.`,
+        { parse_mode: "Markdown" });
     }
   } catch (error) {
     bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
@@ -594,15 +628,21 @@ bot.onText(/\/stats/, async (msg) => {
   const stats = await SupportService.getStats();
   const users = await User.countDocuments();
   const openTickets = await Ticket.countDocuments({ status: { $in: ["open", "in_progress"] } });
+  const slaBreaches = await Analytics.countDocuments({ metric: "sla_breach", date: { $gt: new Date(Date.now() - 24*60*60*1000) } });
   
   bot.sendMessage(config.adminId,
-    `📊 PRO SUPPORT STATS\n\n` +
+    `📊 **PRO SUPPORT STATS**\n\n` +
     `👥 Total Users: ${users}\n` +
     `🎫 Open Tickets: ${openTickets}\n` +
     `📈 Today: ${stats.totalTickets} new\n` +
-    `⏱️ Avg Response: ${Math.round(stats.avgFirstResponse)}min\n` +
+    `⏱️ Avg Response: ${Math.round(stats.avgFirstResponse)} min\n` +
     `⭐ CSAT: ${stats.csatScore.toFixed(1)}/5\n` +
-    `📅 SLA Breaches: ${await Analytics.countDocuments({ metric: "sla_breach", date: { $gt: new Date(Date.now() - 24*60*60*1000) } })}`);
+    `⚠️ SLA Breaches (24h): ${slaBreaches}\n\n` +
+    `📌 **Commands:**\n` +
+    `/tickets - List open tickets\n` +
+    `/resolve <ticketId> - Close ticket\n` +
+    `/stats - This view`,
+    { parse_mode: "Markdown" });
 });
 
 bot.onText(/\/tickets/, async (msg) => {
@@ -611,17 +651,18 @@ bot.onText(/\/tickets/, async (msg) => {
   const tickets = await Ticket.find({ status: { $in: ["open", "in_progress"] } }).sort("-priority").limit(20);
   
   if (tickets.length === 0) {
-    return bot.sendMessage(config.adminId, "No open tickets");
+    return bot.sendMessage(config.adminId, "🎫 No open tickets");
   }
   
-  let text = "🎫 OPEN TICKETS\n\n";
+  let text = "🎫 **OPEN TICKETS**\n\n";
   for (const t of tickets) {
-    text += `${t.ticketId} | ${t.priority.toUpperCase()} | ${t.status}\n`;
-    text += `User: ${t.userId}\n`;
-    text += `Msg: ${t.message.slice(0, 60)}...\n\n`;
+    text += `**${t.ticketId}** | ${t.priority.toUpperCase()} | ${t.status}\n`;
+    text += `👤 User: ${t.userId}\n`;
+    text += `📝 ${t.message.slice(0, 80)}${t.message.length > 80 ? '...' : ''}\n`;
+    text += `⏱️ Created: ${t.createdAt.toLocaleString()}\n\n`;
   }
   
-  bot.sendMessage(config.adminId, text);
+  bot.sendMessage(config.adminId, text, { parse_mode: "Markdown" });
 });
 
 bot.onText(/\/resolve (.+)/, async (msg, match) => {
@@ -629,7 +670,7 @@ bot.onText(/\/resolve (.+)/, async (msg, match) => {
   
   const ticketId = match[1];
   await SupportService.resolveTicket(ticketId);
-  bot.sendMessage(config.adminId, `✅ Ticket ${ticketId} resolved`);
+  bot.sendMessage(config.adminId, `✅ Ticket ${ticketId} resolved and CSAT requested`);
 });
 
 // ================= API ENDPOINTS =================
@@ -658,15 +699,33 @@ app.get("/api/stats", async (req, res) => {
 
 app.get("/health", async (req, res) => {
   const dbState = mongoose.connection.readyState === 1;
+  const botState = bot ? "running" : "stopped";
+  
   res.json({
     status: dbState ? "healthy" : "degraded",
     db: dbState ? "connected" : "disconnected",
+    bot: botState,
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
 });
 
+app.get("/", (req, res) => {
+  res.json({
+    name: "Pro Support Center",
+    version: "2.0.0",
+    status: "operational",
+    endpoints: {
+      health: "/health",
+      stats: "/api/stats",
+      ticket: "/api/ticket/:id",
+      createTicket: "POST /api/ticket"
+    }
+  });
+});
+
 // ================= CRON JOBS =================
+// SLA monitoring every hour
 cron.schedule("0 * * * *", async () => {
   const breachedTickets = await Ticket.find({
     status: { $in: ["open", "in_progress"] },
@@ -678,28 +737,43 @@ cron.schedule("0 * * * *", async () => {
   }
 });
 
+// Daily report at 9 AM
 cron.schedule("0 9 * * *", async () => {
   const stats = await SupportService.getStats("day");
   await bot.sendMessage(config.adminId, 
-    `📈 DAILY REPORT\n\n` +
-    `Tickets: ${stats.totalTickets}\n` +
-    `Open: ${stats.openTickets}\n` +
-    `CSAT: ${stats.csatScore.toFixed(1)}\n` +
-    `Avg Response: ${Math.round(stats.avgFirstResponse)}min`);
+    `📈 **DAILY REPORT**\n\n` +
+    `📅 Date: ${new Date().toLocaleDateString()}\n` +
+    `📊 New Tickets: ${stats.totalTickets}\n` +
+    `🔄 Open: ${stats.openTickets}\n` +
+    `⭐ CSAT: ${stats.csatScore.toFixed(1)}/5\n` +
+    `⏱️ Avg Response: ${Math.round(stats.avgFirstResponse)} min`,
+    { parse_mode: "Markdown" });
+});
+
+// Auto-close stale resolved tickets after 7 days
+cron.schedule("0 0 * * *", async () => {
+  const result = await Ticket.updateMany(
+    { status: "resolved", resolvedAt: { $lt: new Date(Date.now() - 7*24*60*60*1000) } },
+    { status: "closed", closedAt: new Date() }
+  );
+  if (result.modifiedCount > 0) {
+    logger.info(`Auto-closed ${result.modifiedCount} stale resolved tickets`);
+  }
 });
 
 // ================= START SERVER =================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   logger.info(`🚀 PRO Support Center running on port ${PORT}`);
-  console.log(`🤖 Bot active | Admin: ${config.adminId}`);
-  console.log(`📊 API: http://localhost:${PORT}/health`);
+  console.log(`\n✅ Bot is active!`);
+  console.log(`📊 Admin ID: ${config.adminId}`);
+  console.log(`🌐 API: https://auto-reply-xtnl.onrender.com`);
+  console.log(`❤️ Health check: https://auto-reply-xtnl.onrender.com/health\n`);
 });
 
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   logger.info("Shutting down gracefully...");
-  if (redis) await redis.quit();
   await mongoose.disconnect();
   process.exit(0);
 });
