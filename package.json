@@ -1,16 +1,24 @@
 {
-  "name": "studybuddy-helper-bot",
-  "version": "1.0.0",
-  "description": "Telegram helper bot",
-  "main": "bot.js",
+  "name": "pro-support-center",
+  "version": "2.0.0",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "jest",
+    "pm2": "pm2 start bot.js --name support-bot"
   },
   "dependencies": {
-    "axios": "^1.7.2",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "mongoose": "^8.5.1",
-    "node-telegram-bot-api": "^0.66.0"
+    "dotenv": "^16.0.3",
+    "node-telegram-bot-api": "^0.61.0",
+    "mongoose": "^7.0.0",
+    "express": "^4.18.2",
+    "winston": "^3.8.2",
+    "express-rate-limit": "^6.7.0",
+    "ioredis": "^5.3.2",
+    "node-cron": "^3.0.2",
+    "nodemailer": "^6.9.1",
+    "openai": "^4.0.0",
+    "joi": "^17.9.0",
+    "uuid": "^9.0.0"
   }
 }
